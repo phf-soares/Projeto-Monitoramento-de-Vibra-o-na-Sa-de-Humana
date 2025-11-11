@@ -1,0 +1,179 @@
+#include <stdio.h>
+#include <string.h>
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/ringbuf.h"
+
+#define TAG "BNO055_DMAISH"
+
+// ---------- I2C ----------
+#define I2C_PORT              I2C_NUM_0
+#define I2C_SDA               21
+#define I2C_SCL               22
+#define I2C_FREQ_HZ           400000
+
+// ---------- BNO055 ----------
+#define BNO055_ADDR           0x28
+#define REG_ACCEL_X_LSB       0x08   // 6 bytes: X LSB/MSB, Y LSB/MSB, Z LSB/MSB
+
+// ---------- Streaming ----------
+#define SAMPLE_RATE_HZ        1000
+#define TIMER_PERIOD_US       (1000000 / SAMPLE_RATE_HZ)
+
+// Tamanho do bloco (ping-pong). 250 amostras = 250 ms por bloco.
+#define BLOCK_SAMPLES         250
+
+typedef struct {
+    uint32_t t_us;   // timestamp de captura (us)
+    float ax, ay, az;
+} accel_sample_t;
+
+// Ping-pong buffers
+static accel_sample_t bufA[BLOCK_SAMPLES];
+static accel_sample_t bufB[BLOCK_SAMPLES];
+static accel_sample_t *cur_buf = bufA;
+static size_t cur_idx = 0;
+
+// Sinalização e estruturas
+static SemaphoreHandle_t sem_tick;         // dado pelo esp_timer (ISR) -> produtor
+static RingbufHandle_t blk_ring;           // blocos prontos vão para consumidor
+static esp_timer_handle_t tick_timer;
+
+// ---------- I2C init ----------
+static void i2c_init(void)
+{
+    i2c_config_t cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA,
+        .scl_io_num = I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, cfg.mode, 0, 0, 0));
+}
+
+// ---------- Leitura rápida (write+repeated start+read em 1 chamada) ----------
+static inline esp_err_t bno055_read_accel_6(uint8_t out6[6])
+{
+    // Escreve o registrador inicial e lê 6 bytes com re-start
+    esp_err_t err = i2c_master_write_read_device(
+        I2C_PORT, BNO055_ADDR,
+        (uint8_t[]){ REG_ACCEL_X_LSB }, 1,
+        out6, 6,
+        1000 / portTICK_PERIOD_MS
+    );
+    return err;
+}
+
+// ---------- Timer ISR: só sinaliza (não faz I2C!) ----------
+static void IRAM_ATTR tick_isr(void *arg)
+{
+    BaseType_t hp_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(sem_tick, &hp_task_woken);
+    if (hp_task_woken) portYIELD_FROM_ISR();
+}
+
+// ---------- Produtor (alta prioridade, core fixo) ----------
+static void producer_task(void *arg)
+{
+    // Pin this task if quiser: vTaskCoreAffinitySet(NULL, (1 << 0)); // core 0
+    uint8_t raw[6];
+
+    while (1) {
+        // Espera o "tick" de 1 kHz
+        if (xSemaphoreTake(sem_tick, portMAX_DELAY) == pdTRUE) {
+            uint32_t t0 = esp_timer_get_time();
+
+            if (bno055_read_accel_6(raw) == ESP_OK) {
+                int16_t x = (int16_t)((raw[1] << 8) | raw[0]);
+                int16_t y = (int16_t)((raw[3] << 8) | raw[2]);
+                int16_t z = (int16_t)((raw[5] << 8) | raw[4]);
+
+                accel_sample_t s;
+                s.t_us = t0;
+                // 1 LSB = 0.01 m/s² no BNO055
+                s.ax = x / 100.0f;
+                s.ay = y / 100.0f;
+                s.az = z / 100.0f;
+
+                cur_buf[cur_idx++] = s;
+
+                if (cur_idx >= BLOCK_SAMPLES) {
+                    // Bloco cheio: envia ao ring buffer SEM copiar (aponta p/ bloco)
+                    accel_sample_t *full_block = cur_buf;
+                    size_t bytes = sizeof(accel_sample_t) * BLOCK_SAMPLES;
+
+                    // Tenta enfileirar; se cheio, descarta o bloco (ou bloqueie se preferir)
+                    if (xRingbufferSend(blk_ring, full_block, bytes, 0) != pdTRUE) {
+                        // drop: sem espaço no ring (ajuste o tamanho)
+                    }
+
+                    // Alterna ping-pong
+                    if (cur_buf == bufA) cur_buf = bufB; else cur_buf = bufA;
+                    cur_idx = 0;
+                }
+            } else {
+                // erro I2C: opcional marcar amostra inválida
+            }
+        }
+    }
+}
+
+// ---------- Consumidor (baixa prioridade) ----------
+static void consumer_task(void *arg)
+{
+    while (1) {
+        size_t item_size = 0;
+        void *item = xRingbufferReceive(blk_ring, &item_size, portMAX_DELAY);
+        if (item) {
+            // item aponta para um dos buffers ping-pong (A ou B)
+            size_t n = item_size / sizeof(accel_sample_t);
+            accel_sample_t *blk = (accel_sample_t *)item;
+
+            // Exemplo: imprime só 1ª e última amostra do bloco
+            ESP_LOGI(TAG, "Bloco %u amostras | t0=%luus X0=%.2f Y0=%.2f Z0=%.2f | tN=%luus",
+                     (unsigned)n,
+                     (unsigned long)blk[0].t_us, blk[0].ax, blk[0].ay, blk[0].az,
+                     (unsigned long)blk[n-1].t_us);
+
+            // TODO: salvar em SD, enviar por UART/Wi-Fi, etc.
+
+            // MUITO IMPORTANTE: devolver o item ao ring para liberar a referência
+            vRingbufferReturnItem(blk_ring, item);
+        }
+    }
+}
+
+// ---------- app_main ----------
+void app_main(void)
+{
+    i2c_init();
+
+    // Sinalização 1 kHz
+    sem_tick = xSemaphoreCreateBinary();
+    configASSERT(sem_tick);
+
+    // Ring buffer grande o bastante para 4 blocos (~1s de dados) -> 4 * BLOCK_SAMPLES * sizeof(sample)
+    blk_ring = xRingbufferCreate(4 * BLOCK_SAMPLES * sizeof(accel_sample_t), RINGBUF_TYPE_NOSPLIT);
+    configASSERT(blk_ring);
+
+    // Cria produtor (prioridade alta) e consumidor
+    xTaskCreatePinnedToCore(producer_task, "producer", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
+    xTaskCreatePinnedToCore(consumer_task, "consumer", 4096, NULL, 5, NULL, 1);
+
+    // Timer periódico (1 kHz)
+    const esp_timer_create_args_t args = {
+        .callback = &tick_isr,
+        .name = "bno_tick"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&args, &tick_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, TIMER_PERIOD_US));
+
+    ESP_LOGI(TAG, "Streaming BNO055 @ 1 kHz iniciado (ACCONLY, ±2g).");
+}

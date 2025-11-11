@@ -1,0 +1,158 @@
+#include <stdio.h>
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#define TAG "BNO055"
+
+// =============================
+// ENDEREÇOS E REGISTRADORES
+// =============================
+#define BNO055_ADDR                0x28
+#define BNO055_CHIP_ID_ADDR        0x00
+#define BNO055_PAGE_ID_ADDR        0x07
+#define BNO055_OPR_MODE_ADDR       0x3D
+#define BNO055_PWR_MODE_ADDR       0x3E
+#define BNO055_ACCEL_DATA_X_LSB    0x08
+
+// Página 1 — configuração do acelerômetro
+#define BNO055_ACC_CONFIG_0        0x08
+#define BNO055_ACC_CONFIG_1        0x09
+
+// =============================
+// MODOS DE OPERAÇÃO
+// =============================
+#define BNO055_OPERATION_MODE_CONFIG   0x00
+#define BNO055_OPERATION_MODE_ACCONLY  0x01
+#define BNO055_POWER_MODE_NORMAL       0x00
+
+// =============================
+// CONFIG I2C
+// =============================
+#define I2C_MASTER_SCL_IO 22
+#define I2C_MASTER_SDA_IO 21
+#define I2C_MASTER_FREQ_HZ 400000
+#define I2C_MASTER_PORT I2C_NUM_0
+
+// =============================
+// FUNÇÕES AUXILIARES I2C
+// =============================
+static esp_err_t i2c_master_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_PORT, &conf));
+    return i2c_driver_install(I2C_MASTER_PORT, conf.mode, 0, 0, 0);
+}
+
+static esp_err_t bno055_write_byte(uint8_t reg, uint8_t data)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (BNO055_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_write_byte(cmd, data, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static esp_err_t bno055_read_len(uint8_t reg, uint8_t *data, uint8_t len)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (BNO055_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (BNO055_ADDR << 1) | I2C_MASTER_READ, true);
+    if (len > 1)
+        i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, data + len - 1, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+// =============================
+// CONFIGURAÇÃO DO SENSOR
+// =============================
+static void bno055_config_accel_2g_1000Hz(void)
+{
+    // Entrar em modo CONFIG
+    bno055_write_byte(BNO055_OPR_MODE_ADDR, BNO055_OPERATION_MODE_CONFIG);
+    vTaskDelay(pdMS_TO_TICKS(25));
+
+    // Página 1
+    bno055_write_byte(BNO055_PAGE_ID_ADDR, 0x01);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // ±2g => ACC_Config_0 = 0x00
+    bno055_write_byte(BNO055_ACC_CONFIG_0, 0x00);
+
+    // BW = 1000Hz, modo normal => ACC_Config_1 = 0x0D
+    bno055_write_byte(BNO055_ACC_CONFIG_1, 0x0D);
+
+    // Retornar para página 0
+    bno055_write_byte(BNO055_PAGE_ID_ADDR, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // Entrar em modo ACCONLY
+    bno055_write_byte(BNO055_OPR_MODE_ADDR, BNO055_OPERATION_MODE_ACCONLY);
+    vTaskDelay(pdMS_TO_TICKS(25));
+
+    ESP_LOGI(TAG, "BNO055 configurado: ±2g, 1000 Hz, ACCONLY");
+}
+
+// =============================
+// LEITURA DE ACELERAÇÃO
+// =============================
+static void bno055_read_accel(float *ax, float *ay, float *az)
+{
+    uint8_t buf[6];
+    bno055_read_len(BNO055_ACCEL_DATA_X_LSB, buf, 6);
+
+    int16_t x = ((int16_t)buf[1] << 8) | buf[0];
+    int16_t y = ((int16_t)buf[3] << 8) | buf[2];
+    int16_t z = ((int16_t)buf[5] << 8) | buf[4];
+
+    // Conversão: 1 LSB = 1 m/s² / 100 (datasheet)
+    *ax = (float)x / 100.0f;
+    *ay = (float)y / 100.0f;
+    *az = (float)z / 100.0f;
+}
+
+// =============================
+// LOOP PRINCIPAL
+// =============================
+void app_main(void)
+{
+    ESP_ERROR_CHECK(i2c_master_init());
+
+    uint8_t id = 0;
+    bno055_read_len(BNO055_CHIP_ID_ADDR, &id, 1);
+    ESP_LOGI(TAG, "BNO055 ID: 0x%02X", id);
+
+    if (id != 0xA0) {
+        ESP_LOGE(TAG, "Sensor BNO055 não detectado!");
+        vTaskDelay(portMAX_DELAY);
+    }
+
+    bno055_config_accel_2g_1000Hz();
+
+    float ax, ay, az;
+    while (1)
+    {
+        bno055_read_accel(&ax, &ay, &az);
+        ESP_LOGI(TAG, "Accel: X=%.2f | Y=%.2f | Z=%.2f [m/s²]", ax, ay, az);
+        vTaskDelay(pdMS_TO_TICKS(100)); // leitura a ~10Hz (ajuste conforme necessário)
+    }
+}

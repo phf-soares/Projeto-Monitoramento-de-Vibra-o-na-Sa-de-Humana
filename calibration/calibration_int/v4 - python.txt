@@ -1,0 +1,93 @@
+import serial, struct, time, csv, os
+import numpy as np
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtGui
+
+# --- Config UART ---
+PORT = 'COM5'         # ajuste para sua porta
+BAUD = 921600
+PACKET_SIZE = 16      # uint32 + 3x float
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+# --- PyQtGraph setup ---
+pg.setConfigOptions(antialias=True)
+win = pg.GraphicsLayoutWidget(show=True, title="BNO055 Streaming (ESP32)")
+plot = win.addPlot(title="Aceleração (m/s²)")
+plot.addLegend()
+plot.setYRange(-20, 20)
+
+curve_x = plot.plot(pen='r', name='ax')
+curve_y = plot.plot(pen='g', name='ay')
+curve_z = plot.plot(pen='b', name='az')
+
+buf_len = 2000
+ax_buf = np.zeros(buf_len)
+ay_buf = np.zeros(buf_len)
+az_buf = np.zeros(buf_len)
+idx = 0
+
+# --- CSV recording ---
+recording = False
+csv_file = None
+csv_writer = None
+record_count = 0
+
+def start_recording():
+    global recording, csv_file, csv_writer, record_count
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    fname = f"bno055_{timestamp}.csv"
+    csv_file = open(fname, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['t_us', 'ax', 'ay', 'az'])
+    record_count = 0
+    recording = True
+    print(f"▶️ Gravando em: {fname}")
+
+def stop_recording():
+    global recording, csv_file
+    if recording and csv_file:
+        csv_file.close()
+        print(f"⏹️ Gravação encerrada. Total: {record_count} amostras.")
+    recording = False
+
+# --- Atualização periódica ---
+def update():
+    global idx, ax_buf, ay_buf, az_buf, record_count
+    while ser.in_waiting >= PACKET_SIZE:
+        data = ser.read(PACKET_SIZE)
+        t_us, ax, ay, az = struct.unpack('<Ifff', data)
+        ax_buf[idx % buf_len] = ax
+        ay_buf[idx % buf_len] = ay
+        az_buf[idx % buf_len] = az
+        idx += 1
+        if recording:
+            csv_writer.writerow([t_us, ax, ay, az])
+            record_count += 1
+
+    if idx > buf_len:
+        x = np.arange(buf_len)
+        curve_x.setData(x, ax_buf)
+        curve_y.setData(x, ay_buf)
+        curve_z.setData(x, az_buf)
+
+timer = pg.QtCore.QTimer()
+timer.timeout.connect(update)
+timer.start(10)
+
+# --- Teclado (R = grava, ESC = sai) ---
+def keyPressed(evt):
+    global recording
+    key = evt.key()
+    if key == QtCore.Qt.Key_R:
+        if not recording:
+            start_recording()
+        else:
+            stop_recording()
+    elif key == QtCore.Qt.Key_Escape:
+        stop_recording()
+        QtGui.QApplication.quit()
+
+win.keyPressEvent = keyPressed
+
+print("✅ Pronto. Pressione 'R' para gravar / parar. ESC para sair.")
+pg.QtGui.QApplication.instance().exec_()

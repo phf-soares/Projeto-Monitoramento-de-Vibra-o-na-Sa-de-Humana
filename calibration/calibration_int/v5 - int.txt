@@ -1,0 +1,165 @@
+#include <stdio.h>
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/ringbuf.h"
+
+#define TAG "BNO055_INT"
+
+// ---------- I2C ----------
+#define I2C_PORT      I2C_NUM_0
+#define I2C_SDA       21
+#define I2C_SCL       22
+#define I2C_FREQ_HZ   400000
+#define BNO055_ADDR   0x28
+#define REG_ACCEL_X_LSB  0x08
+
+// ---------- UART ----------
+#define UART_PORT     UART_NUM_1
+#define UART_TX_PIN   17
+#define UART_RX_PIN   16
+#define UART_BAUD     921600
+
+// ---------- INTERRUPÇÃO ----------
+#define BNO_INT_PIN   27  // GPIO ligado ao pino INT do sensor
+
+typedef struct {
+    uint32_t t_us;
+    float ax, ay, az;
+} accel_sample_t;
+
+#define BLOCK_SAMPLES 250
+
+static accel_sample_t bufA[BLOCK_SAMPLES];
+static accel_sample_t bufB[BLOCK_SAMPLES];
+static accel_sample_t *cur_buf = bufA;
+static size_t cur_idx = 0;
+
+static SemaphoreHandle_t sem_data_ready;
+static RingbufHandle_t blk_ring;
+
+// ---------- I2C init ----------
+static void i2c_init(void) {
+    i2c_config_t cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA,
+        .scl_io_num = I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, cfg.mode, 0, 0, 0));
+}
+
+// ---------- UART init ----------
+static void uart_init(void) {
+    uart_config_t cfg = {
+        .baud_rate = UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 2048, 0, 0, NULL, 0));
+}
+
+// ---------- GPIO interrupção (Data Ready) ----------
+static void IRAM_ATTR gpio_isr_handler(void *arg) {
+    BaseType_t hp_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(sem_data_ready, &hp_task_woken);
+    if (hp_task_woken) portYIELD_FROM_ISR();
+}
+
+// ---------- Configuração do pino de interrupção ----------
+static void int_gpio_init(void) {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,  // INT ativo baixo
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = 1ULL << BNO_INT_PIN,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE
+    };
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BNO_INT_PIN, gpio_isr_handler, NULL);
+}
+
+// ---------- Habilitar interrupção no BNO055 ----------
+static void bno055_enable_interrupt(void) {
+    uint8_t data[2];
+    // INT_EN (0x10) = 0x80 (habilita INT)
+    data[0] = 0x10; data[1] = 0x80;
+    i2c_master_write_to_device(I2C_PORT, BNO055_ADDR, data, 2, 100 / portTICK_PERIOD_MS);
+    // INT_MSK (0x11) = 0x01 (Data Ready)
+    data[0] = 0x11; data[1] = 0x01;
+    i2c_master_write_to_device(I2C_PORT, BNO055_ADDR, data, 2, 100 / portTICK_PERIOD_MS);
+}
+
+// ---------- Leitura rápida ----------
+static inline esp_err_t bno055_read_accel_6(uint8_t out6[6]) {
+    return i2c_master_write_read_device(I2C_PORT, BNO055_ADDR,
+                                        (uint8_t[]){ REG_ACCEL_X_LSB }, 1,
+                                        out6, 6,
+                                        1000 / portTICK_PERIOD_MS);
+}
+
+// ---------- Produtor (acionado pelo semáforo da interrupção) ----------
+static void producer_task(void *arg) {
+    uint8_t raw[6];
+    while (1) {
+        if (xSemaphoreTake(sem_data_ready, portMAX_DELAY) == pdTRUE) {
+            uint32_t t0 = esp_timer_get_time();
+            if (bno055_read_accel_6(raw) == ESP_OK) {
+                int16_t x = (int16_t)((raw[1] << 8) | raw[0]);
+                int16_t y = (int16_t)((raw[3] << 8) | raw[2]);
+                int16_t z = (int16_t)((raw[5] << 8) | raw[4]);
+                accel_sample_t s = { t0, x / 100.0f, y / 100.0f, z / 100.0f };
+                cur_buf[cur_idx++] = s;
+                if (cur_idx >= BLOCK_SAMPLES) {
+                    accel_sample_t *blk = cur_buf;
+                    size_t bytes = sizeof(accel_sample_t) * BLOCK_SAMPLES;
+                    xRingbufferSend(blk_ring, blk, bytes, 0);
+                    cur_buf = (cur_buf == bufA) ? bufB : bufA;
+                    cur_idx = 0;
+                }
+            }
+        }
+    }
+}
+
+// ---------- Consumer (envia UART) ----------
+static void consumer_task(void *arg) {
+    while (1) {
+        size_t item_size = 0;
+        accel_sample_t *blk = (accel_sample_t *)xRingbufferReceive(blk_ring, &item_size, portMAX_DELAY);
+        if (blk) {
+            for (size_t i = 0; i < item_size / sizeof(accel_sample_t); i++)
+                uart_write_bytes(UART_PORT, (const char*)&blk[i], sizeof(accel_sample_t));
+            vRingbufferReturnItem(blk_ring, blk);
+        }
+    }
+}
+
+// ---------- app_main ----------
+void app_main(void) {
+    i2c_init();
+    uart_init();
+    int_gpio_init();
+
+    sem_data_ready = xSemaphoreCreateBinary();
+    blk_ring = xRingbufferCreate(4 * BLOCK_SAMPLES * sizeof(accel_sample_t), RINGBUF_TYPE_NOSPLIT);
+    configASSERT(sem_data_ready && blk_ring);
+
+    xTaskCreatePinnedToCore(producer_task, "producer", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
+    xTaskCreatePinnedToCore(consumer_task, "consumer", 4096, NULL, 5, NULL, 1);
+
+    bno055_enable_interrupt();
+    ESP_LOGI(TAG, "BNO055 modo ACCONLY com interrupção de Data Ready iniciado.");
+}
