@@ -1,5 +1,10 @@
 # Projeto Monitoramento de Vibração na Saúde Humana
 
+Esquemático:
+
+<img width="1738" height="1249" alt="image" src="https://github.com/user-attachments/assets/fabed7d5-461e-411c-85cf-12f9ced1f36b" />
+
+
 Aquisição de dados: 160 Hz ou a cada 0.00625(s) ou 6.25 (ms)
 
 Processamento: RMS e Shock a cada 1 segundo
