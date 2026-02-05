@@ -1,29 +1,12 @@
 # Projeto Monitoramento de Vibração na Saúde Humana
 
+Fluxograma básico:
+
+<img width="1760" height="1360" alt="_Fluxograma" src="https://github.com/user-attachments/assets/1a49d379-6005-4342-b2f2-760b81ffe6ce" />
+
 Esquemático:
 
 <img width="1738" height="1249" alt="image" src="https://github.com/user-attachments/assets/fabed7d5-461e-411c-85cf-12f9ced1f36b" />
-
-
-Aquisição de dados: 160 Hz ou a cada 0.00625(s) ou 6.25 (ms)
-
-Processamento: RMS e Shock a cada 1 segundo
-
-
-Configuração do acelerômetro:
-Em Fusion-mode:
-<img width="998" height="257" alt="image" src="https://github.com/user-attachments/assets/c4e9a6ff-7639-427f-a2a7-36c58c767827" />
-Calibrado
-<img width="1097" height="399" alt="image" src="https://github.com/user-attachments/assets/4eaaf4ba-54a4-462f-81a0-3a457f229cfb" />
-
-
-Em Non-fusion mode:
-<img width="1064" height="792" alt="image" src="https://github.com/user-attachments/assets/e6fbf48d-9861-4ebf-b65d-aa94d1aeac43" />
-
-ACC_Config: 00010100b
-
-<img width="1047" height="956" alt="image" src="https://github.com/user-attachments/assets/a6ed2ce7-ac4d-4776-aa99-ae3e327b418b" />
-
 
 
 Código compilado em Arduino IDE com biblioteca para esp32.
@@ -55,7 +38,7 @@ Feito por mim: https://wokwi.com/projects/434601176080578561
 
 *SD:*
 
-Tenho... 32GB...
+Capacidade 32 GB
 
 Alimentado pelo USB.
 
@@ -67,14 +50,13 @@ Protocolo UART entre ESP32 e:
 
 Fonte: https://www.youtube.com/watch?v=THCJWWsyh10
 
+Cartão SIM 2G
+
 Montagem:
 
 ![image](https://github.com/user-attachments/assets/190d87d6-d7bf-4c1e-8c5d-8c385ba7c2de)
 Feito por mim: https://wokwi.com/projects/435414590476866561
 
-*Cartão SIM 2G:*
-
-Falta...
 
 Alimentação
 -
@@ -116,8 +98,8 @@ MQTT Broker
 
 MQTT Client
 - App Android
--------
-Reactive Native ?
+
+Código:
 
 
 
