@@ -2,7 +2,8 @@
 
 Fluxograma básico:
 
-<img width="1760" height="1360" alt="_Fluxograma" src="https://github.com/user-attachments/assets/1a49d379-6005-4342-b2f2-760b81ffe6ce" />
+<img width="1760" height="1360" alt="_Fluxograma (1)" src="https://github.com/user-attachments/assets/d9bbccdf-5cc7-49ee-875b-6cf5d5d7f4b4" />
+
 
 Esquemático:
 
