@@ -87,6 +87,8 @@ Comunicação e display WEB -  enviando para ThingSpeak via GPRS
 
 Configuração de canal no ThingSpeak, teste com PuTTY do HTTP requests via GPRS.
 
+https://thingspeak.mathworks.com/channels/3007277
+
 Aplicativo Android
 -
 
