@@ -100,7 +100,12 @@ MQTT Broker
 MQTT Client
 - App Android
 
-Código:
+Código: https://github.com/phf-soares/MQTTClientSample_Android
+
+Calibração e testes:
+-
+
+Código: https://github.com/phf-soares/BNO055-ESP32-PlatformIO
 
 
 
